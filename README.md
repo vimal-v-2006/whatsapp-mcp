@@ -28,8 +28,10 @@ git clone https://github.com/vimal-v-2006/whatsapp-mcp.git
 cd whatsapp-mcp
 npm install
 
-# boot the server — a QR code prints to your terminal
-node server.mjs
+### First-time pairing (do this first, once)
+
+```bash
+node pair.mjs          # prints the QR and waits for you to scan
 ```
 
 On your phone: **WhatsApp → Settings → Linked devices → Link a device** → scan the terminal QR (a PNG copy is saved to `~/.whatsapp-mcp/qr.png` if the terminal QR is unreadable).
@@ -37,6 +39,16 @@ On your phone: **WhatsApp → Settings → Linked devices → Link a device** �
 That's it — you scanned **once**. The session lives in `~/.whatsapp-mcp/`; every future start reconnects silently, even headless.
 
 > **No QR-friendly terminal?** Use a pairing code instead: WhatsApp → Linked devices → *Link with phone number*. The tool `whatsapp_pairing_code` returns an 8-character code.
+
+### Starting the MCP server (any harness, any time after pairing)
+
+```bash
+node server.mjs
+```
+
+With a saved session it just reconnects silently — no QR.
+
+> **Pairing got interrupted / stuck?** Run `rm -rf ~/.whatsapp-mcp` and `node pair.mjs` again. Also make sure no old `node server.mjs` process is still running (`pkill -f server.mjs`) — a zombie server holds the session and blocks fresh QRs.
 
 ---
 
@@ -237,6 +249,7 @@ whatsapp-mcp/
 ├── server.mjs               # MCP stdio server
 ├── pi-extension/index.ts    # native pi extension (same 13 tools)
 ├── examples/send-once.mjs   # headless automation sample
+├── pair.mjs                 # node pair.mjs — one-shot QR pairing helper
 ├── test-client.mjs          # npm test — MCP smoke test
 └── README.md
 ```
