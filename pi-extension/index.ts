@@ -12,8 +12,8 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-// @ts-ignore - plain ESM core module (resolved relative to this file)
-import * as wa from "../core/whatsapp.mjs";
+// @ts-ignore - plain ESM API facade (routes to the session owner over a local bridge if needed)
+import * as wa from "../core/api.mjs";
 
 interface ToolDef {
   name: string;
@@ -63,12 +63,14 @@ const TOOLS: ToolDef[] = [
   {
     name: "whatsapp_read_messages",
     label: "WhatsApp Read Messages",
-    description: "Read the latest messages from a chat (JID, phone number, or contact/group name).",
+    description: "Read messages from a chat (JID, phone number, or name), optionally within a date range (since/until, e.g. '2025-09-21'). History is fetched on demand.",
     parameters: Type.Object({
       chat: Type.String({ description: "chat JID, phone number, or name" }),
-      limit: Type.Optional(Type.Number({ description: "max messages (default 20)" })),
+      limit: Type.Optional(Type.Number({ description: "max messages (default 20, max 200)" })),
+      since: Type.Optional(Type.String({ description: "only messages at/after this date, e.g. '2025-09-21' or ISO/epoch seconds" })),
+      until: Type.Optional(Type.String({ description: "only messages at/before this date (same formats as since)" })),
     }),
-    run: (a) => wa.readMessages(a.chat, { limit: a.limit ?? 20 }),
+    run: (a) => wa.readMessages(a.chat, { limit: a.limit ?? 20, since: a.since, until: a.until }),
   },
   {
     name: "whatsapp_send_message",
@@ -120,13 +122,14 @@ const TOOLS: ToolDef[] = [
   {
     name: "whatsapp_search_messages",
     label: "WhatsApp Search Messages",
-    description: "Full-text search across locally synced chat history.",
+    description: "Full-text search across recent chats, scoped to a time window (default last 2 days). History is fetched on demand.",
     parameters: Type.Object({
       query: Type.String(),
       limit: Type.Optional(Type.Number({ description: "max results (default 20)" })),
-      max_chats: Type.Optional(Type.Number({ description: "max chats to scan (default 50)" })),
+      days: Type.Optional(Type.Number({ description: "search only the last N days (default 2, max 30)" })),
+      max_chats: Type.Optional(Type.Number({ description: "max chats to scan (default 100)" })),
     }),
-    run: (a) => wa.searchMessages(a.query, { limit: a.limit ?? 20, maxChats: a.max_chats ?? 50 }),
+    run: (a) => wa.searchMessages(a.query, { limit: a.limit ?? 20, days: a.days ?? 2, maxChats: a.max_chats ?? 100 }),
   },
   {
     name: "whatsapp_group_info",
@@ -138,8 +141,10 @@ const TOOLS: ToolDef[] = [
 ];
 
 export default function (pi: ExtensionAPI) {
-  // start the WhatsApp session in the background at extension load
-  (wa as any).getSocket().catch(() => {});
+  // claim (or join) the WhatsApp session in the background at extension load.
+  // Ownership lives with the process: when pi exits, the lock goes stale and
+  // the next client (hermes, a script, another pi) picks the session back up.
+  wa.status().catch(() => {});
 
   for (const t of TOOLS) {
     pi.registerTool({

@@ -10,12 +10,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import * as wa from "./core/whatsapp.mjs";
+import * as wa from "./core/api.mjs";
 
 const server = new McpServer({ name: "whatsapp", version: "1.0.0" });
 
 // start the WhatsApp session in the background immediately
-wa.getSocket().catch(() => {});
+// Elect/claim the WhatsApp session (becomes owner, or joins an existing owner).
+wa.status().catch(() => {});
+process.on("SIGINT", () => wa.shutdown());
+process.on("SIGTERM", () => wa.shutdown());
 
 function ok(data) {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -68,12 +71,15 @@ define("whatsapp_list_chats", {
 
 define("whatsapp_read_messages", {
   title: "Read WhatsApp messages",
-  description: "Read the latest messages from a chat. `chat` accepts a JID (123@s.whatsapp.net), a phone number (+123...) or a contact/chat name.",
+  description: "Read messages from a chat, optionally within a date range. `chat` accepts a JID (123@s.whatsapp.net), a phone number (+123...) or a contact/chat name. History is fetched on demand — nothing is bulk-downloaded.",
   inputSchema: {
     chat: z.string().describe("Chat JID, phone number, or contact/group name"),
-    limit: z.number().int().min(1).max(100).optional().describe("Max messages to return (default 20)"),
+    limit: z.number().int().min(1).max(200).optional().describe("Max messages to return (default 20)"),
+    since: z.string().optional().describe("Only messages at/after this date, e.g. '2025-09-21' or '2025-09-21T18:00:00Z' (or epoch seconds)"),
+    until: z.string().optional().describe("Only messages at/before this date (same formats as `since`)"),
   },
-}, wrap((a) => wa.readMessages(a.chat, { limit: a.limit ?? 20 })));
+}, wrap((a) => wa.readMessages(a.chat, { limit: a.limit ?? 20, since: a.since, until: a.until })));
+
 
 define("whatsapp_send_message", {
   title: "Send WhatsApp message",
@@ -119,13 +125,14 @@ define("whatsapp_get_contact", {
 
 define("whatsapp_search_messages", {
   title: "Search WhatsApp messages",
-  description: "Full-text search across locally synced chat history.",
+  description: "Full-text search across recent chats, scoped to a time window (default last 2 days). History is fetched on demand.",
   inputSchema: {
     query: z.string().describe("Text to search for"),
     limit: z.number().int().min(1).max(100).optional().describe("Max results (default 20)"),
-    max_chats: z.number().int().min(1).max(200).optional().describe("Max chats to scan (default 50)"),
+    days: z.number().int().min(1).max(30).optional().describe("Search only the last N days (default 2)"),
+    max_chats: z.number().int().min(1).max(200).optional().describe("Max chats to scan (default 100)"),
   },
-}, wrap((a) => wa.searchMessages(a.query, { limit: a.limit ?? 20, maxChats: a.max_chats ?? 50 })));
+}, wrap((a) => wa.searchMessages(a.query, { limit: a.limit ?? 20, days: a.days ?? 2, maxChats: a.max_chats ?? 100 })));
 
 define("whatsapp_group_info", {
   title: "WhatsApp group info",

@@ -7,7 +7,8 @@
 │  core/whatsapp.mjs — Baileys session + all read/write actions    │
 │   • QR pairing (scan once, session persists)                     │
 │   • auto-reconnect, auto-restart, QR re-pair on unlink           │
-│   • in-memory chat / contact / message store                     │
+│   • on-demand history (no bulk download), date-ranged reads      │
+│   • one connection shared across pi + hermes + scripts           │
 └───────────────┬──────────────────────────────────┬───────────────┘
                 │                                  │
       ┌─────────▼─────────────┐          ┌─────────▼───────────────┐
@@ -61,13 +62,13 @@ With a saved session it just reconnects silently — no QR.
 | `whatsapp_unlink` | Unlink device, wipe local session, generate a fresh QR |
 | `whatsapp_pairing_code` | 8-char code pairing instead of QR (phone number input) |
 | `whatsapp_list_chats` | Recent DMs/groups: name, unread count, last message preview |
-| `whatsapp_read_messages` | Latest N messages of a chat. Accepts JID, phone number, or name |
+| `whatsapp_read_messages` | Latest N messages — or a window via `since` / `until` (e.g. `since: "2026-09-20"`). Accepts JID, phone number, or name |
 | `whatsapp_send_message` | Send a text message |
 | `whatsapp_send_media` | Send image / video / audio / document / sticker from a local file path |
 | `whatsapp_delete_message` | Revoke a message (by id from `whatsapp_read_messages`) |
 | `whatsapp_list_contacts` | Known contacts (JID + name) from synced history |
 | `whatsapp_get_contact` | Resolve contact by JID/phone/name → existence, LID, profile picture |
-| `whatsapp_search_messages` | Full-text search across locally synced chat history |
+| `whatsapp_search_messages` | Full-text search. Defaults to the last **2 days**; tune with `days`, `since`/`until`, `maxChats` |
 | `whatsapp_group_info` | Group subject, description, size, participants |
 
 Identifiers are flexible everywhere: `15551234567@s.whatsapp.net` (JID), `+15551234567` (phone), or a contact/group **name** are all accepted by `to` / `chat` / `group` parameters.
@@ -77,8 +78,9 @@ Identifiers are flexible everywhere: `15551234567@s.whatsapp.net` (JID), `+15551
 ```
 whatsapp_send_message  { to: "+15551234567", text: "Deploy done ✅" }
 whatsapp_read_messages { chat: "Alice", limit: 10 }
+whatsapp_read_messages { chat: "Alice", since: "2026-09-20", limit: 50 }   # one specific day
 whatsapp_send_media    { to: "Team", path: "/tmp/report.pdf", caption: "Q2 numbers" }
-whatsapp_search_messages { query: "invoice", limit: 10 }
+whatsapp_search_messages { query: "invoice", days: 7 }
 ```
 
 ---
@@ -212,8 +214,9 @@ Run `node examples/send-once.mjs` for a working sample script.
 
 - **[Baileys](https://github.com/WhiskeySockets/Baileys)** (WhatsApp Web multi-device protocol, pinned to `6.5.0` — the last line with the full chat-store API) opens a linked-device session on first run.
 - **Pairing:** the QR from `connection.update` is rendered to the terminal (stderr) and to `~/.whatsapp-mcp/qr.png`. Credentials are stored on disk by `useMultiFileAuthState`, so restarts are silent.
-- **History:** `syncFullHistory` pulls recent history into an in-memory store on link; `whatsapp_search_messages` / `whatsapp_read_messages` read from it (older history is fetched lazily via the store's `loadMessages`).
-- **Resilience:** connection drops auto-restart (2s), logout events wipe creds and re-emit a QR (3s), QR is re-rendered whenever the server rotates it.
+- **On-demand history (no bulk download):** nothing is fetched at process start. The first tool that actually needs history (list/read/search/contacts) triggers a one-time sync of the recent history WhatsApp retains for this account (the same window WhatsApp Web loads), which is cached in memory; later reads/searches filter that cache by `since`/`until`/`days` with zero extra network. (Baileys 6.5 exposes no per-date fetch API — the sync window is the protocol's finest granularity — so "fetch only the last 2 days" is enforced by fetching-once + date-filtering + caching.)
+- **One connection, many processes:** WhatsApp allows a single active connection per linked device. This project elects one **owner** process (first to run — pi, hermes, or a script) that holds the Baileys socket; every other process joins it as a **client** over a loopback-only, token-authenticated local bridge (lock file: `~/.whatsapp-mcp/daemon.json`). If the owner exits, the next tool call picks the session back up from the saved credentials. Run pi + hermes + cron scripts at the same time without conflicts.
+- **Resilience:** connection drops auto-restart (2s; `conflict` closes back off 20–30s with jitter so stray processes can't ping-pong), logout events wipe creds and re-emit a QR (3s), QR is re-rendered whenever the server rotates it.
 - **Protocol hygiene:** only the MCP JSON-RPC goes to stdout; all logs and the QR go to stderr, so MCP clients stay clean.
 
 ### Configuration
@@ -232,7 +235,8 @@ Run `node examples/send-once.mjs` for a working sample script.
 | `Device is not linked yet` error from tools | Scan the QR first (`whatsapp_link` returns it) |
 | Keeps reconnecting | Unstable network, or the phone itself unlinked the device (battery-saver modes can do this) |
 | Logged out / QR after restart | Someone unlinked the device from the phone; just re-scan |
-| Messages not searchable | Search covers the locally synced window (recent chats); use `whatsapp_read_messages` on a specific chat for more |
+| Empty reads right after a restart | The in-memory cache starts empty; the first read triggers the on-demand sync (a few seconds for the initial snapshot). Retry once, or ask for a specific window (`since`/`until`) |
+| `connection closed (conflict)` in logs | A process from before an upgrade still holds the same session. Normal operation handles ownership automatically — restart your pi/hermes sessions once so they run the new code |
 | Update broke things | Baileys is pinned for a reason — don't `npm update` it casually; WhatsApp protocol changes happen fast |
 
 ## Security & fair use
@@ -245,7 +249,9 @@ Run `node examples/send-once.mjs` for a working sample script.
 
 ```
 whatsapp-mcp/
-├── core/whatsapp.mjs        # session + actions (shared by both front-ends)
+├── core/whatsapp.mjs        # Baileys session + actions (the core)
+├── core/daemon.mjs          # single-owner election + loopback client bridge
+├── core/api.mjs             # facade: routes each call local or to the owner
 ├── server.mjs               # MCP stdio server
 ├── pi-extension/index.ts    # native pi extension (same 13 tools)
 ├── examples/send-once.mjs   # headless automation sample

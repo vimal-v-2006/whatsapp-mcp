@@ -33,6 +33,8 @@ let restartTimer = null;
 let lastQrEmitted = null;
 let online = false;
 let seenFirstUpdate = false;
+let shuttingDown = false;
+let everOpened = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,7 +78,8 @@ async function startSocket() {
     version,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: false,
-    syncFullHistory: true,
+    // No bulk history download at startup — history is fetched on demand (see ensureHistory).
+    syncFullHistory: false,
     defaultQueryTimeoutMs: 20000,
   });
 
@@ -86,6 +89,7 @@ async function startSocket() {
     if (update.qr) renderQr(update.qr);
     if (update.connection === "open") {
       online = true;
+      everOpened = true;
       lastQrEmitted = null;
       try {
         fs.unlinkSync(QR_FILE);
@@ -93,29 +97,37 @@ async function startSocket() {
       log(`[whatsapp-mcp] connected as ${sock.user?.id ?? "unknown"}`);
     } else if (update.connection === "close") {
       online = false;
-      const reason = update.closeReason;
-      // Baileys passes closeReason as a name string ("restartRequired", …) or a raw number
+      if (shuttingDown) return; // expected teardown — don't reschedule
+      // Baileys 6.x: the reason lives in lastDisconnect.error (statusCode + message), NOT update.closeReason
+      const err = update.lastDisconnect?.error;
+      const code = err?.statusCode ?? update.closeReason;
       const reasonName =
-        typeof reason === "number"
-          ? DisconnectReason[reason] ?? `code ${reason}`
-          : String(reason ?? "unknown");
+        typeof code === "number"
+          ? DisconnectReason[code] ?? `code ${code}`
+          : String(err?.message ?? code ?? "unknown");
       const loggedOut = reasonName === "loggedOut";
       log(
         `[whatsapp-mcp] connection closed (reason=${reasonName}) — restarting socket${loggedOut ? " (device unlinked, fresh QR coming)" : ""}…`
       );
-      if (!loggedOut) {
+      if (!everOpened) {
         log("[whatsapp-mcp] If you're mid-pairing: the QR on screen is now INVALID — scan the NEW one as soon as it prints.");
       }
-      // Any close is recoverable: restart the socket. Wipe creds only on an explicit logout.
-      scheduleRestart(loggedOut);
+      const conflict = /conflict/i.test(reasonName);
+      if (conflict) {
+        log("[whatsapp-mcp] 'conflict' means another process is holding this same session — only one connection per device is allowed. Backing off with jitter.");
+      }
+      // Any unexpected close is recoverable: restart the socket. Wipe creds only on an explicit logout.
+      // Conflicts get a long, jittered backoff so two stray processes can't ping-pong at 2s intervals.
+      scheduleRestart(loggedOut, conflict ? 20_000 + Math.random() * 10_000 : 2000);
     }
   });
   store.bind(sock.ev);
   return sock;
 }
 
-function scheduleRestart(wipeCreds = false) {
+function scheduleRestart(wipeCreds = false, delayMs = 2000) {
   if (restartTimer) return;
+  shuttingDown = true;
   restartTimer = setTimeout(async () => {
     restartTimer = null;
     if (wipeCreds) fs.rmSync(DATA_DIR, { recursive: true, force: true });
@@ -126,10 +138,11 @@ function scheduleRestart(wipeCreds = false) {
       await sock?.end?.(undefined);
     } catch {}
     sock = null;
+    shuttingDown = false; // safe to auto-restart again on the next unexpected close
     starting = startSocket().catch((e) => log("[whatsapp-mcp] restart failed:", e?.message)).finally(() => {
       starting = null;
     });
-  }, wipeCreds ? 3000 : 2000);
+  }, wipeCreds ? 3000 : delayMs);
   restartTimer.unref?.();
 }
 
@@ -251,12 +264,107 @@ function resolveJid(input) {
   if (exact) return exact.id;
   const ci = list.find((c) => (c.name || c.notify)?.toLowerCase() === t.toLowerCase());
   if (ci) return ci.id;
-  for (const c of store.chats.map()) {
+  for (const c of store.chats.all()) {
     if (c.name?.toLowerCase() === t.toLowerCase()) return c.id;
   }
   throw new Error(
     `Could not resolve "${t}". Use a full JID (e.g. 1234567890@s.whatsapp.net), a phone number (e.g. +1234567890), or a name from whatsapp_list_contacts.`
   );
+}
+
+/* ---------------- on-demand history (no bulk download) ---------------- */
+
+// The server only syncs a *recent* window of history per chat (WhatsApp's app-state sync).
+// We never bulk-download at startup: queries trigger a resync only when the local cache
+// doesn't cover what the caller asked for (a specific date range, or any history at all).
+const ALL_PATCH_NAMES = ["critical_block", "critical_unblock_low", "regular_high", "regular_low", "regular"];
+const RESYNC_COOLDOWN_MS = 30_000;
+const RESYNC_WAIT_MS = 10_000;
+let lastResyncAt = 0;
+let resyncInFlight = null;
+
+/** Raw epoch-ms for a store message (Baileys gives seconds or ISO strings). */
+function tsNum(m) {
+  const t = m?.messageTimestamp;
+  if (t == null) return 0;
+  const ms = typeof t === "number" ? (t < 1e12 ? t * 1000 : t) : Date.parse(t);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/** Accepts ISO strings / epoch seconds / epoch millis. Returns epoch ms or null. */
+export function parseDate(v) {
+  if (v == null || v === "") return null;
+  if (typeof v === "number") return v < 1e12 ? v * 1000 : v;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Baileys only asks the server for a full snapshot (`return_snapshot=true`)
+ * when NO saved app-state sync version exists — otherwise the server sends
+ * just the delta since that version. Every fresh process starts with an empty
+ * in-memory store but the saved version is current, so a plain resync would
+ * return (almost) nothing. For the first history fetch of a process we
+ * therefore clear the saved versions so the server returns the full current
+ * state of the sync collections (the same recent history WhatsApp Web loads).
+ */
+async function clearSavedSyncVersions(s) {
+  try {
+    const keys = s.authState.keys;
+    const current = await keys.get("app-state-sync-version", ALL_PATCH_NAMES);
+    const toClear = {};
+    for (const c of ALL_PATCH_NAMES) if (current[c]) toClear[c] = null; // null => file removed
+    if (Object.keys(toClear).length) await keys.set({ "app-state-sync-version": toClear });
+  } catch (e) {
+    log("[whatsapp-mcp] could not clear saved sync versions:", e?.message || e);
+  }
+}
+
+let initialSyncDone = false;
+
+async function ensureHistory(s, { jid = null, sinceMs = null, timeoutMs = RESYNC_WAIT_MS } = {}) {
+  const local = () => (jid ? (store.messages?.[jid]?.array ?? []) : []);
+  const covered = (arr) => {
+    if (jid) {
+      if (arr.length === 0) return false;
+      if (sinceMs == null) return true; // some local history is enough
+      if (tsNum(arr[0]) <= sinceMs) return true; // cache reaches back to (or past) the requested range
+      if (Date.now() - tsNum(arr[arr.length - 1]) < 120_000) return true; // actively updating — assume covered
+      return false; // gap between the requested range and the cache
+    }
+    return store.chats.length > 0 || Object.keys(store.contacts).length > 0;
+  };
+  if (covered(local())) return;
+
+  const isInitial = !initialSyncDone;
+  let waitMs = timeoutMs;
+  const recentResync = Date.now() - lastResyncAt < RESYNC_COOLDOWN_MS;
+  if (!resyncInFlight && !recentResync) {
+    if (isInitial) {
+      initialSyncDone = true;
+      log("[whatsapp-mcp] first read in this process — fetching current history from WhatsApp (one-time, then cached)...");
+      await clearSavedSyncVersions(s);
+      waitMs = Math.max(timeoutMs, 45_000); // snapshots are larger; give them room
+    } else {
+      log(`[whatsapp-mcp] fetching more history on demand (resync app-state)…`);
+    }
+    lastResyncAt = Date.now();
+    resyncInFlight = (async () => {
+      try {
+        await s.resyncAppState(ALL_PATCH_NAMES, isInitial);
+      } catch (e) {
+        log("[whatsapp-mcp] history resync failed:", e?.message || e);
+      }
+    })().finally(() => {
+      resyncInFlight = null;
+    });
+  }
+  // Wait (bounded) for the sync patches to land in the local store.
+  const t0 = Date.now();
+  while (Date.now() - t0 < waitMs) {
+    if (covered(local())) return;
+    await sleep(1000);
+  }
 }
 
 function tsOf(m) {
@@ -304,70 +412,98 @@ function describeMessage(m) {
 /* ---------------- read tools ---------------- */
 
 export async function listChats({ limit = 50 } = {}) {
-  await getSocket({ wait: true });
-  let chats = store.chats.map();
-  if (Array.isArray(chats)) {
-    chats = chats.sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0));
-  }
-  chats = chats.slice(0, Number(limit) || 50);
-  let bots = [];
-  try {
-    bots = (await sock.getBotListV2()) || [];
-  } catch {}
-  const botById = Object.fromEntries(bots.map((b) => [b.jid, b]));
+  const s = await getSocket({ wait: true });
+  await ensureHistory(s, {}); // fetch the recent-chats window on demand if the cache is empty
+  const chats = store.chats.all()
+    .filter((c) => c.id && !c.id.endsWith("@broadcast"))
+    .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
+    .slice(0, Number(limit) || 50);
   return {
     count: chats.length,
     chats: chats.map((c) => {
-      const b = botById[c.id];
-      const msgs = c.messages?.length ? c.messages : [];
+      const msgs = c.messages?.array ?? [];
       const last = msgs.length ? msgs[msgs.length - 1] : null;
       return {
         id: c.id,
-        name: c.name || b?.chatName || last?.pushName || null,
-        isGroup: !!c.isGroup,
-        unread: c.unreadCount ?? b?.unreadCount ?? 0,
-        lastMessageAt: last ? tsOf(last) : b?.conversationTimestamp ? new Date(b.conversationTimestamp * 1000).toISOString() : null,
-        lastMessage: last ? describeMessage(last) : b?.lastMessage ? describeMessage(b.lastMessage) : null,
+        name: c.name || last?.pushName || null,
+        isGroup: !!c.isGroup || c.id.endsWith("@g.us"),
+        unread: c.unreadCount ?? 0,
+        lastMessageAt: last
+          ? tsOf(last)
+          : c.conversationTimestamp
+            ? new Date(c.conversationTimestamp * 1000).toISOString()
+            : null,
+        lastMessage: last ? describeMessage(last) : null,
       };
     }),
   };
 }
 
-export async function readMessages(chat, { limit = 20 } = {}) {
+/**
+ * Read a chat's history.
+ * @param {string} chat JID, +phone, or contact name
+ * @param {{ limit?: number, since?: string|number, until?: string|number }} opts
+ *   `since`/`until` are ISO dates ("2025-09-21") or epoch seconds/ms — history is
+ *   fetched on demand from the server only when the local cache doesn't cover the range.
+ */
+export async function readMessages(chat, { limit = 20, since, until } = {}) {
   const s = await getSocket({ wait: true });
   const jid = resolveJid(chat);
-  let msgs;
-  try {
-    msgs = await store.loadMessages(jid, Math.min(Number(limit) || 20, 100), {});
-  } catch (e) {
-    throw new Error(`Could not load messages for ${jid}: ${e?.message || e}`);
-  }
-  const arr = Array.isArray(msgs) ? msgs : [...msgs];
-  return { chat: jid, count: arr.length, messages: arr.map(describeMessage) };
+  const want = Math.min(Number(limit) || 20, 200);
+  const sinceMs = parseDate(since);
+  const untilMs = parseDate(until);
+  await ensureHistory(s, { jid, sinceMs });
+  let arr = store.messages?.[jid]?.array ?? [];
+  if (sinceMs != null) arr = arr.filter((m) => tsNum(m) >= sinceMs);
+  if (untilMs != null) arr = arr.filter((m) => tsNum(m) <= untilMs);
+  arr = arr.slice(-want);
+  return {
+    chat: jid,
+    count: arr.length,
+    messages: arr.map(describeMessage),
+    ...(arr.length === 0
+      ? {
+          note: "No messages in that range. WhatsApp's sync only covers a recent window of history per chat; try a wider date range or a more recent one.",
+        }
+      : {}),
+  };
 }
 
-export async function searchMessages(query, { limit = 20, maxChats = 50 } = {}) {
-  await getSocket({ wait: true });
+/**
+ * Search message text across recent chats, scoped to a time window.
+ * @param {{ limit?: number, days?: number, maxChats?: number }} opts
+ *   `days` limits the search to the last N days (default 2) — the window is fetched
+ *   on demand from the server if not already cached.
+ */
+export async function searchMessages(query, { limit = 20, days = 2, maxChats = 100 } = {}) {
+  const s = await getSocket({ wait: true });
   const q = String(query).toLowerCase();
-  const chats = store.chats.map().slice(0, Number(maxChats) || 50);
+  const sinceMs = Date.now() - (Number(days) || 2) * 86_400_000;
+  await ensureHistory(s, { sinceMs }); // global: fetch the recent window if the cache is empty
+  const chats = store.chats.all()
+    .sort((a, b) => (b.conversationTimestamp || 0) - (a.conversationTimestamp || 0))
+    .slice(0, Number(maxChats) || 100);
   const results = [];
   for (const c of chats) {
-    for (const m of c.messages?.array ?? c.messages ?? []) {
+    for (const m of c.messages?.array ?? []) {
+      if (tsNum(m) < sinceMs) continue; // outside the requested window
       const d = describeMessage(m);
       const hay = [d.text, d.sender, c.name, d.media?.fileName, d.media?.caption].filter(Boolean).join(" ").toLowerCase();
       if (hay.includes(q)) {
         results.push({ chat: c.id, chatName: c.name || null, ...d });
-        if (results.length >= (Number(limit) || 20)) return { query, count: results.length, results };
+        if (results.length >= (Number(limit) || 20)) return { query, windowDays: Number(days) || 2, count: results.length, results };
       }
     }
   }
   return {
     query,
+    windowDays: Number(days) || 2,
     count: results.length,
     results,
-    note: "Searches messages in the locally synced history (recent chats). Use whatsapp_read_messages for a specific chat.",
+    note: "Searches the locally synced history within the requested window. Use whatsapp_read_messages for a specific chat, or pass `days` to widen the window.",
   };
 }
+
 
 /* ---------------- write tools ---------------- */
 
@@ -437,7 +573,8 @@ export async function deleteMessage(chat, messageId, { fromMe = true } = {}) {
 /* ---------------- contacts & groups ---------------- */
 
 export async function listContacts({ limit = 100 } = {}) {
-  await getSocket({ wait: true });
+  const s = await getSocket({ wait: true });
+  await ensureHistory(s, {}); // contacts arrive with the on-demand sync if the cache is empty
   const contacts = Object.values(store.contacts || {})
     .filter((c) => c.id && !c.id.endsWith("@broadcast"))
     .slice(0, Number(limit) || 100);
