@@ -94,16 +94,20 @@ async function startSocket() {
     } else if (update.connection === "close") {
       online = false;
       const reason = update.closeReason;
-      const code = Number(reason);
-      log(`[whatsapp-mcp] connection closed (code=${code})`);
-      const loggedOut = code === DisconnectReason.loggedOut;
-      const restartable =
-        loggedOut ||
-        code === DisconnectReason.restartRequired ||
-        code === DisconnectReason.connectionClosed ||
-        code === DisconnectReason.timedOut ||
-        code === DisconnectReason.multipeer;
-      if (restartable) scheduleRestart(loggedOut);
+      // Baileys passes closeReason as a name string ("restartRequired", …) or a raw number
+      const reasonName =
+        typeof reason === "number"
+          ? DisconnectReason[reason] ?? `code ${reason}`
+          : String(reason ?? "unknown");
+      const loggedOut = reasonName === "loggedOut";
+      log(
+        `[whatsapp-mcp] connection closed (reason=${reasonName}) — restarting socket${loggedOut ? " (device unlinked, fresh QR coming)" : ""}…`
+      );
+      if (!loggedOut) {
+        log("[whatsapp-mcp] If you're mid-pairing: the QR on screen is now INVALID — scan the NEW one as soon as it prints.");
+      }
+      // Any close is recoverable: restart the socket. Wipe creds only on an explicit logout.
+      scheduleRestart(loggedOut);
     }
   });
   store.bind(sock.ev);
